@@ -23,17 +23,19 @@ If you're in an environment where saving a memory dump to disk is infeasible (fo
 Once you have a memory snapshot, you can analyze it by running `./python-memtools --path=memdump`. This will perform basic analysis, and you'll then get an analysis shell. From here, you can use the various commands to inspect the contents of the snapshot. Run `help` in the shell to see all of the available commands, and all of the options - there are more than what's listed below.
 
 Some of the more commonly useful shell commands are:
-* `repr <ADDRESS>`: Show the contents of the object at `<ADDRESS>`. This can show the keys and values in a dict, items in a lis, set, or tuple, local variables in a stack frame object, etc. When an object is found by one of the below commands, the address of that object is the 16-digit hex number following the `@` after the object.
+* `repr <ADDRESS>`: Shows the contents of the object at `<ADDRESS>`. This can show the keys and values in a dict, items in a list, set, or tuple, local variables in a stack frame object, etc. When an object is found by one of the below commands, the address of that object (which can be used with `repr`) is the 16-digit hex number following the `@` after the object. This command has many options; run `help` in the shell to see what they are.
 * `count-by-type`: Counts the number of objects of each type. If you see a surprisingly large number of objects of some type, that could indicate a memory leak.
-* `async-task-graph`: Finds all asyncio tasks and shows what they're waiting on, organized into a list of trees. If you ever see `!seen` in the output here, that indicates a deadlocked cycle of tasks awaiting each other!
+* `async-task-graph`: Finds all asyncio tasks and shows what they're waiting on, organized into a list of trees. If you ever see `<!seen>` in the output here, that indicates a deadlocked cycle of tasks awaiting each other!
 * `find-all-stacks`: Finds all execution frames and organizes them into stacktraces. This is similar to what `py-spy dump` does.
-* `find-all-objects --type-name=NAME`: Finds all objects of the specified type.
-* `find-all-objects --type-name=frame`: Finds all the execution frames. If you see a lot of suspended frames in the httpx library, for example, that probably means your program is waiting on many HTTP responses from some remote service.
-* `find-all-objects --type-name=coroutine`: Finds all coroutine objects. Note that coroutines are distinct from asyncio Tasks, and there is not a 1:1 mapping of Tasks to coroutines.
+* `find-all-objects --type-name=<NAME>`: Finds all objects of the specified type. Generally this is most useful for the `frame` type; if you see a lot of suspended frames in the httpx library, for example, that probably means your program is waiting on many HTTP responses from some remote service.
+* `find-all-objects --type-name=coroutine`: Finds all coroutine objects. Note that coroutines are distinct from asyncio Tasks, and there is usually not a 1:1 mapping of Tasks to coroutines.
 * `aggregate-strings`: Finds all str or bytes objects and produces a histogram of their lengths.
-* `find-module <NAME>`: Finds a module object. This is useful if you want to see the value of a module-level global variable. If you want to get the list of all loaded modules, use `find-module sys` and look at the `modules` dict within it. (You can then use `repr` to see the contents of a specific module from that dict.)
+* `find-module <NAME>`: Finds a module object. This is useful if you want to see the values of module-level global variables. If you want to get the list of all loaded modules, use `find-module sys` and look at the `modules` dict within it. (You can then use `repr` to see the contents of a specific module from that dict.)
 
-For more advanced debugging, you can see the memory region list with the `regions` command, look at raw memory using the `context` command, and search for raw data using the `find` command.
+For more advanced debugging, you can inspect raw memory with these commands:
+* `regions`: Shows the list of all memory regions.
+* `context <ADDRESS> [--size=<SIZE>]`: Shows `<SIZE>` bytes (default 0x100) of memory before and after `<ADDRESS>`.
+* `find <HEX-DATA>` or `find "<STRING>"`: Searches for raw data or a string.
 
 ## Example scenarios
 
@@ -151,7 +153,14 @@ So, this huge dictionary is the `response_futures` attribute on the `Client` cla
 
 python-memtools works by making a snapshot of the process' memory space, then searches through it using some strong heuristics to find Python objects. This is done by first finding the base type object, which has a distinctive memory signature - its type pointer points to itself (which shouldn't be the case for any other object), its name pointer points to the string "type", and it has many other pointer fields which must either be null or point to a valid address. Once python-memtools has found the base type object, it searches for other type objects by finding all valid PyTypeObject instances whose type pointer points to the base type object.
 
-Once this index of type objects is built, most other functions are implemented as simple memory scans that look for objects whose type pointers match one of the type pointers from the index. A few very common types (int, str, list, dict, etc.) are implemented in python-memtools, so it can understand their contents and format them in a way that looks more like Python syntax.
+Once this index of type objects is built, most other functions are implemented as simple memory scans that look for objects whose type pointers match one of the type pointers from the index, followed by some basic sorts, filters, or graph algorithms. Some very common types (int, str, list, dict, etc.) are implemented in python-memtools, so it can understand their contents and format them in a way that looks more like Python syntax.
+
+## Future work
+
+Things we'd like to do in the future:
+* Add support for Python versions after 3.10
+* Add support for more standard-library types (e.g. collections.deque)
+* Add support for core dump files (probably can use resource_dasm's ELF loader to help with this)
 
 ## Contributing
 
