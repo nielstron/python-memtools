@@ -16,6 +16,10 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
 #include "Common.hh"
 
 class MemoryReader;
@@ -101,6 +105,9 @@ public:
 
 private:
   uint64_t pid;
+#ifdef __APPLE__
+  mach_port_t task;
+#endif
 };
 
 struct MemoryMappedFile {

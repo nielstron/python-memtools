@@ -15,12 +15,40 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach/vm_map.h>
+#include <mach/vm_region.h>
+#include <unistd.h>
+#endif
+
 ProcessPauseGuard::ProcessPauseGuard(uint64_t pid) : pid(pid) {
+#ifdef __APPLE__
+  kern_return_t kr = task_for_pid(mach_task_self(), this->pid, &this->task);
+  if (kr != KERN_SUCCESS) {
+    throw std::runtime_error(std::format("task_for_pid failed: {} (are you running as root?)", mach_error_string(kr)));
+  }
+  kr = task_suspend(this->task);
+  if (kr != KERN_SUCCESS) {
+    throw std::runtime_error(std::format("task_suspend failed: {}", mach_error_string(kr)));
+  }
+  // Sleep for 10ms to avoid macOS High Sierra kernel bug
+  usleep(10000);
+#else
   kill(this->pid, SIGSTOP);
+#endif
 }
 
 ProcessPauseGuard::~ProcessPauseGuard() {
+#ifdef __APPLE__
+  if (this->task != MACH_PORT_NULL) {
+    task_resume(this->task);
+    mach_port_deallocate(mach_task_self(), this->task);
+  }
+#else
   kill(this->pid, SIGCONT);
+#endif
 }
 
 MemoryMappedFile::MemoryMappedFile(int fd, uint64_t offset, size_t size, bool writable)
@@ -173,6 +201,41 @@ std::vector<std::pair<MappedPtr<void>, size_t>> MemoryReader::all_regions() cons
 
 std::vector<std::pair<MappedPtr<void>, size_t>> MemoryReader::ranges_for_pid(uint64_t pid) {
   std::vector<std::pair<MappedPtr<void>, size_t>> ranges;
+#ifdef __APPLE__
+  mach_port_t task;
+  kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+  if (kr != KERN_SUCCESS) {
+    throw std::runtime_error(std::format("task_for_pid failed: {} (are you running as root?)", mach_error_string(kr)));
+  }
+
+  mach_vm_address_t address = 1;
+  mach_vm_size_t size = 0;
+  vm_region_extended_info_data_t info;
+  mach_msg_type_number_t info_count = VM_REGION_EXTENDED_INFO_COUNT;
+  mach_port_t object_name;
+
+  while (true) {
+    info_count = VM_REGION_EXTENDED_INFO_COUNT;
+    kr = mach_vm_region(task, &address, &size, VM_REGION_EXTENDED_INFO,
+        (vm_region_info_t)&info, &info_count, &object_name);
+    if (kr != KERN_SUCCESS) {
+      break; // No more regions
+    }
+
+    // Only include readable, non-shared regions (equivalent to Linux's filtering)
+    // SM_SHARED and SM_TRUESHARED are excluded, similar to Linux's 's' flag
+    if ((info.protection & VM_PROT_READ) &&
+        (info.share_mode != SM_SHARED) &&
+        (info.share_mode != SM_TRUESHARED)) {
+      ranges.emplace_back(std::make_pair(MappedPtr<void>{address}, size));
+    }
+
+    // Move to next region
+    address += size;
+  }
+
+  mach_port_deallocate(mach_task_self(), task);
+#else
   auto maps_f = phosg::fopen_unique(std::format("/proc/{}/maps", pid), "rt");
   for (const auto& line : phosg::split(phosg::read_all(maps_f.get()), '\n')) {
     if (line.empty()) {
@@ -190,6 +253,7 @@ std::vector<std::pair<MappedPtr<void>, size_t>> MemoryReader::ranges_for_pid(uin
     MappedPtr<void> end{std::stoull(addr_tokens.at(1), nullptr, 16)};
     ranges.emplace_back(std::make_pair(start, start.bytes_until(end)));
   }
+#endif
   return ranges;
 }
 
@@ -207,6 +271,42 @@ void MemoryReader::dump(uint64_t pid, const std::string& directory, size_t max_t
   }
 
   auto total_size_str = phosg::format_size(total_size);
+#ifdef __APPLE__
+  mach_port_t task;
+  kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+  if (kr != KERN_SUCCESS) {
+    throw std::runtime_error(std::format("task_for_pid failed: {} (are you running as root?)", mach_error_string(kr)));
+  }
+
+  phosg::parallel_range<uint64_t>([&](uint64_t range_index, size_t) -> bool {
+    const auto& [addr, size] = ranges[range_index];
+
+    auto out_f = phosg::fopen_unique(std::format("{}/mem.{}.{}.bin", directory, addr, addr.offset_bytes(size)), "wb");
+
+    auto end = addr.offset_bytes(size);
+    for (auto read_addr = addr; read_addr < end;) {
+      size_t bytes_to_read = std::min<size_t>(read_addr.bytes_until(end), 1024 * 1024);
+      try {
+        vm_offset_t data_ptr = 0;
+        mach_msg_type_number_t data_size = bytes_to_read;
+        kr = mach_vm_read(task, read_addr.addr, bytes_to_read, &data_ptr, &data_size);
+        if (kr != KERN_SUCCESS) {
+          break;
+        }
+        phosg::fwritex(out_f.get(), reinterpret_cast<const void*>(data_ptr), data_size);
+        vm_deallocate(mach_task_self(), data_ptr, data_size);
+        read_addr.addr += data_size;
+      } catch (const std::exception& e) {
+        break;
+      }
+    }
+    phosg::fwrite_fmt(stderr, "... {}:{}\n", addr, end);
+    return false;
+  },
+      0, ranges.size(), max_threads, nullptr);
+
+  mach_port_deallocate(mach_task_self(), task);
+#else
   phosg::scoped_fd mem_fd(std::format("/proc/{}/mem", pid), O_RDONLY);
   phosg::parallel_range<uint64_t>([&](uint64_t range_index, size_t) -> bool {
     const auto& [addr, size] = ranges[range_index];
@@ -228,6 +328,7 @@ void MemoryReader::dump(uint64_t pid, const std::string& directory, size_t max_t
     return false;
   },
       0, ranges.size(), max_threads, nullptr);
+#endif
 
   phosg::fwrite_fmt(stderr, "{} in {} ranges\n", total_size_str, ranges.size());
 }
